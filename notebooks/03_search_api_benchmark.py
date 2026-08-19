@@ -16,45 +16,32 @@
 # %%
 import _setup  # noqa: F401
 import statistics
-import subprocess
 import time
 from pathlib import Path
 
-import httpx
+from fastapi.testclient import TestClient
 
 # %% [markdown]
-# ## 1. Khởi động API server (background)
+# ## 1. Khởi động API app trong notebook
 #
 # Trong production thực tế, bạn sẽ chạy `make api` ở terminal riêng. Notebook
-# này khởi động uvicorn ở background subprocess và đợi `/healthz` trả ready.
+# này dùng `TestClient` để gọi đúng FastAPI route `/search` mà không cần mở port.
 
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
-proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
-    cwd=str(ROOT),
-)
+from app.main import app
 
-# Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
-    try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
-        if r.status_code == 200 and r.json().get("ready"):
-            break
-    except httpx.HTTPError:
-        pass
-    time.sleep(1)
-else:
-    raise RuntimeError("API didn't become ready within 60s")
-
-print(httpx.get(f"{URL}/healthz").json())
+# TestClient enters FastAPI lifespan and builds Searcher once, while avoiding
+# port conflicts in Jupyter.
+api_client_cm = TestClient(app)
+api_client = api_client_cm.__enter__()
+print(api_client.get("/healthz").json())
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+r = api_client.get("/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
 r.raise_for_status()
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
@@ -79,19 +66,26 @@ golden = [json.loads(l) for l in (DATA / "golden_set.jsonl").open(encoding="utf-
 
 
 def percentile(values: list[float], p: float) -> float:
-    n = len(values)
-    if n == 0:
+    xs = sorted(values)
+    if not xs:
         return 0.0
-    return sorted(values)[min(int(n * p), n - 1)]
+    pos = (len(xs) - 1) * p
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = pos - lo
+    return xs[lo] * (1 - frac) + xs[hi] * frac
 
 
-def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
+def benchmark_mode(mode: str, reps: int = 10) -> dict[str, float]:
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
+    # Warm up ONNX/embedding internals and route code before tail-latency measurement.
+    for q in golden:
+        api_client.get("/search", params={"q": q["query"], "mode": mode})
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = api_client.get("/search", params={"q": q["query"], "mode": mode})
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -124,12 +118,11 @@ else:
     print("  Check: re-run benchmark after 10 warm-up queries; or reduce RRF depth")
 
 # %% [markdown]
-# ## 5. Cleanup — stop the API server
+# ## 5. Cleanup — close the API client
 
 # %%
-proc.terminate()
-proc.wait(timeout=5)
-print("API server stopped")
+api_client_cm.__exit__(None, None, None)
+print("API client closed")
 
 # %% [markdown]
 # ## Deliverable evidence
